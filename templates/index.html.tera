@@ -1,0 +1,8 @@
+{% extends "base" %}
+
+{% block title %}Home{% endblock %}
+
+{% block content %}
+<h1>Home</h1>
+<p>Welcome {{ name }}</p>
+{% endblock %}

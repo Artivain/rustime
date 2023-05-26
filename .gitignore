@@ -17,3 +17,13 @@ Cargo.lock
 # Added by cargo
 
 /target
+
+# temp files
+/temp
+
+.env
+
+node_modules/
+package-lock.json
+static/css
+static/js

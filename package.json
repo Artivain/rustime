@@ -1,0 +1,27 @@
+{
+  "name": "rustime-bootstrap",
+  "version": "0.0.0",
+  "description": "Compile bootstrap for Rustime",
+  "private": true,
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "npm run css && npm run js",
+		"css": "sass --style compressed --no-source-map --no-error-css --load-path node_modules scss/:static/css/",
+		"js": "tsc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Artivain/rustime.git"
+  },
+  "author": "Artivain",
+  "license": "GPL-3.0",
+  "bugs": {
+    "url": "https://github.com/Artivain/rustime/issues"
+  },
+  "homepage": "https://github.com/Artivain/rustime#readme",
+  "devDependencies": {
+    "bootstrap": "^5.3.0-alpha3",
+    "sass": "^1.62.1",
+    "typescript": "^5.0.4"
+  }
+}
