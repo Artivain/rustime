@@ -1,84 +1,202 @@
-use crate::db::{JobType, Schedule, DB};
-use sqlx::types::chrono::{self, NaiveDateTime};
-use std::{
-	str::FromStr,
-	sync::{
-		atomic::{AtomicBool, Ordering},
-		mpsc, Arc,
-	},
-	thread,
-};
+use crate::{db::{Job, JobType, Method, Schedule, DB}, USER_AGENT};
+use reqwest::{Client, ClientBuilder};
+use sqlx::types::chrono::{DateTime, NaiveDateTime, Utc};
+use std::{str::FromStr, time::Duration};
 
-pub struct Scheduler<'a> {
-	db: &'a DB,
-	rx: mpsc::Receiver<ThreadMessage>,
-}
+pub struct Scheduler {}
 
-impl<'a> Scheduler<'a> {
-	pub async fn new(db: &'a DB) -> Result<Scheduler<'a>, String> {
-		let schedules: Vec<Schedule> = match db.get_schedules().await {
-			Ok(schedules) => schedules,
-			Err(err) => return Err(format!("Failed to get schedules\n{}", err)),
+impl Scheduler {
+	pub async fn new() -> Result<Scheduler, String> {
+		let db: DB = match DB::new().await {
+			Ok(db) => db,
+			Err(err) => return Err(err),
 		};
 
+		// Get all schedules from database
+		let schedules: Vec<Schedule> = match db.get_schedules().await {
+			Ok(schedules) => schedules,
+			Err(err) => return Err(format!("Failed to get schedules from database\n{}", err)),
+		};
+
+		// Make sure they will all run
 		for schedule in schedules {
-			// Make sure there is a job for each schedule
-			match db.get_job(schedule.id as u64).await {
-				Ok(_) => (),
-				Err(err) => match err {
-					// If there isn't, create one
-					sqlx::Error::RowNotFound => {
-						let run_at: NaiveDateTime = get_next_run_datetime(&schedule.cron);
-						match db
-							.create_job(JobType::Monitoring, run_at, Option::from(schedule.id))
+			if schedule.enabled {
+				// If the schedule is enabled, make sure it has a job
+				match db.get_job_by_linked_id(schedule.id).await {
+					Ok(_) => (),
+					Err(_) => {
+						// Get next run time
+						let run_at: NaiveDateTime = match get_next_run_time(&schedule.cron) {
+							Some(next_run_time) => next_run_time,
+							None => {
+								println!(
+									"Failed to get next run time for schedule {}",
+									schedule.id
+								);
+								continue;
+							}
+						};
+
+						// Create job
+						db.create_job(JobType::Monitoring, run_at, Some(schedule.id))
 							.await
-						{
-							Ok(_) => (),
-							Err(err) => return Err(format!("Failed to create job\n{}", err)),
-						}
+							.unwrap();
 					}
-					_ => return Err(format!("Failed to get job\n{}", err)),
-				},
+				};
 			}
 		}
 
-		let (_, rx): (mpsc::Sender<ThreadMessage>, mpsc::Receiver<ThreadMessage>) = mpsc::channel();
-		let this: Scheduler = Scheduler { db, rx };
-		this.create_thread();
+		tokio::spawn(async {
+			loop {
+				tokio::spawn(async {
+					println!("Checking for jobs to run");
 
-		Ok(this)
-	}
+					let db: DB = match DB::new().await {
+						Ok(db) => db,
+						Err(err) => {
+							println!("Failed to connect to database\n{}", err);
+							return;
+						}
+					};
 
-	/// Refresh when the next job should run
-	pub async fn refresh() {}
+					let client: Client = ClientBuilder::new()
+						.timeout(Duration::from_secs(30))
+						.user_agent(USER_AGENT)
+						.build()
+						.unwrap();
 
-	/// Create a thread to run the scheduler
-	fn create_thread(&self) {
-		// 	let receiver: &mpsc::Receiver<ThreadMessage> = &self.rx;
-		// 	let db: Arc<&DB> = Arc::new(self.db);
+					let jobs: Vec<Job> = match db.get_jobs_to_run().await {
+						Ok(jobs) => jobs,
+						Err(err) => {
+							println!("Failed to get jobs to run\n{}", err);
+							return;
+						}
+					};
 
-		// 	thread::spawn(move || {
-		// 		loop {
-		// 			match receiver.try_recv() {
-		// 				Ok(msg) => match msg {
-		// 					ThreadMessage::Refresh => (),
-		// 				},
-		// 				Err(mpsc::TryRecvError::Empty) => (),
-		// 				Err(mpsc::TryRecvError::Disconnected) => panic!("Scheduler thread disconnected"),
-		// 			}
-		// 		}
-		// 	});
-		// }
-		println!("Not implemented");
+					for job in jobs {
+						match db.delete_job(job.id).await {
+							Ok(_) => (),
+							Err(_) => continue,
+						}
+
+						match job.job_type {
+							JobType::Monitoring => {
+								println!("Running monitoring job {}", job.id);
+
+								let schedule: Schedule =
+									match db.get_schedule(job.linked_id.unwrap()).await {
+										Ok(schedule) => schedule,
+										Err(err) => {
+											println!(
+												"Failed to get schedule for job {}\n{}",
+												job.id, err
+											);
+											continue;
+										}
+									};
+
+								let (is_up, down_reason) = match schedule.method {
+									Method::HEAD => {
+										execute_http(
+											&client,
+											&schedule.target,
+											reqwest::Method::HEAD,
+										)
+										.await
+									}
+									Method::GET => {
+										execute_http(
+											&client,
+											&schedule.target,
+											reqwest::Method::GET,
+										)
+										.await
+									}
+									Method::POST => {
+										execute_http(
+											&client,
+											&schedule.target,
+											reqwest::Method::POST,
+										)
+										.await
+									}
+								};
+
+								if is_up != schedule.is_up {
+									match is_up {
+										true => {
+											db.set_schedule_up(schedule.id).await.unwrap_or(());
+
+										},
+										false => db.set_schedule_down(
+											schedule.id,
+											down_reason.unwrap_or("Unknown".to_string()),
+										),
+									}
+								} else if !is_up
+									&& down_reason.unwrap() != schedule.down_reason.unwrap()
+								{
+									db.set_schedule_down(
+										schedule.id,
+										down_reason.unwrap_or("Unknown".to_string()),
+									)
+									.await
+									.unwrap_or(());
+								}
+							}
+						}
+					}
+
+					db.close().await;
+				});
+
+				tokio::time::sleep(Duration::from_secs(10)).await;
+			}
+		});
+
+		db.close().await;
+		Ok(Scheduler {})
 	}
 }
 
-fn get_next_run_datetime(exp: &str) -> NaiveDateTime {
-	let schedule: cron::Schedule = cron::Schedule::from_str(exp).unwrap();
-	let next: chrono::DateTime<chrono::Utc> = schedule.upcoming(chrono::Utc).next().unwrap();
-	next.naive_utc()
+fn get_next_run_time(cron: &str) -> Option<NaiveDateTime> {
+	let s: cron::Schedule = match cron::Schedule::from_str(cron) {
+		Ok(s) => s,
+		Err(_) => return None,
+	};
+
+	// Get the next run time
+	let next: Option<DateTime<Utc>> = s.upcoming(Utc).next();
+
+	match next {
+		Some(next) => Some(next.naive_utc()),
+		None => None,
+	}
 }
 
-enum ThreadMessage {
-	Refresh,
+async fn execute_http(
+	client: &Client,
+	url: &str,
+	method: reqwest::Method,
+) -> (bool, Option<String>) {
+	match client.request(method, url).build() {
+		Ok(req) => match client.execute(req).await {
+			Ok(res) => {
+				if res.status().is_success() {
+					(true, None)
+				} else {
+					(
+						false,
+						Some(format!(
+							"{} {}",
+							res.status().as_u16(),
+							res.status().canonical_reason().unwrap()
+						)),
+					)
+				}
+			}
+			Err(err) => (false, Some(format!("Could not execute request: {}", err))),
+		},
+		Err(err) => (false, Some(format!("Could not build request: {}", err))),
+	}
 }

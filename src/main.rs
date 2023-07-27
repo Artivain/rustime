@@ -8,8 +8,11 @@ use rocket::{catchers, get, routes, State};
 use rocket_dyn_templates::{context, Template};
 
 mod db;
+mod notify;
 mod scheduler;
 mod web;
+
+pub static USER_AGENT: &str = concat!("Rustime/", env!("CARGO_PKG_VERSION"));
 
 #[rocket::main]
 async fn main() {
@@ -34,7 +37,7 @@ async fn main() {
 	};
 
 	println!("Initializing scheduler");
-	match Scheduler::new(&db).await {
+	match Scheduler::new().await {
 		Ok(_) => (),
 		Err(err) => {
 			emergency_web_server(format!("Failed to initialize scheduler\n{}", err)).await;
